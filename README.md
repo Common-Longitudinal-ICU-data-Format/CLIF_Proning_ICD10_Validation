@@ -48,6 +48,7 @@ Refer to the [CLIF data dictionary](https://clif-icu.com/data-dictionary/data-di
 1. Rename `config/config_template.yaml` to `config/config.yaml` and fill in your site's `clif_data_path`, `project_location`, `file_type`, `site`, and `site_time_zone`. See [`config/README.md`](config/README.md).
 2. Run [`00_local_CLIF_prone_incidence_cohort_identification_wCOVID.Rmd`](code/00_local_CLIF_prone_incidence_cohort_identification_wCOVID.Rmd) to build the cohort and the filtered CLIF tables.
 3. Run [`01_local_prone_icd_validation_study.Rmd`](code/02_local_prone_icd_validation_study.Rmd) to produce the ICD-10 validation results in `project_output/icd_revision_results_UPLOAD/`.
+4. Upload `project_output/icd_revision_results_UPLOAD/` to box folder
 
 ## Source / acknowledgments
 Cohort identification logic (notebook 00) is adapted from the original multi-center study repository: [CLIF_Proning_Incidence_Severe_ARF](https://github.com/Common-Longitudinal-ICU-data-Format/CLIF_Proning_Incidence_Severe_ARF).
