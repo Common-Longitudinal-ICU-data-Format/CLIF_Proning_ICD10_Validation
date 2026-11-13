@@ -45,10 +45,8 @@ sapply(packages, install_if_missing)
 rm(packages, install_if_missing)
 
 #Set Working Director as the Project Root
-project_root <- file.path( find_root(rprojroot::has_dir("CLIF_Proning_Incidence_Severe_ARF")),
-  "CLIF_Proning_Incidence_Severe_ARF")
-#project_root <- file.path( find_root(rprojroot::has_dir("CLIF_Proning_Incidence_Severe_ARF-main-Jan 2026 rerun")),
-#  "CLIF_Proning_Incidence_Severe_ARF-main-Jan 2026 rerun")
+project_root <- file.path( find_root(rprojroot::has_dir("CLIF_Proning_ICD10_Validation")),
+  "CLIF_Proning_ICD10_Validation")
 knitr::opts_knit$set(root.dir = project_root)
 getwd()
 
