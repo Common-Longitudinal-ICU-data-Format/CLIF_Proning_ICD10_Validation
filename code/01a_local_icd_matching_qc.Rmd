@@ -1,0 +1,488 @@
+---
+title: "01a_icd_matching_qc"
+author: "QC Companion to 01_local_prone_icd_validation_study"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+<!--
+PURPOSE
+This notebook does NOT reproduce or alter any of notebook 01's outputs, and does NOT touch or
+re-derive notebook 00's cohort-building logic. cohort_hospitalization_ids is treated purely as a
+fixed, already-built input, exactly as notebook 01 treats it - this QC is scoped strictly to
+notebook 01's own filtering/joining logic.
+
+It exists only to diagnose why a site's ICD-10-PCS proning/ventilation codes, which are confirmed
+present in the raw clif_patient_procedures table, are not showing up as matches in notebook 01's
+final joined_df (any_proning_icd / any_ventilation_icd).
+
+Every check below is tagged [PASS] / [WARN] / [FAIL] / [INFO] so the log is self-explanatory
+without needing to re-read this notebook:
+  [PASS] - this step behaves as expected, not the cause of the problem
+  [WARN] - a real formatting/data issue was found, but it may or may not fully explain the symptom
+  [FAIL] - this step reproduces notebook 01's own stop()/zero-row failure mode - strong candidate
+  [INFO] - informational context, not a pass/fail judgment
+
+It re-runs notebook 01's exact filtering/joining pipeline one step at a time and records ONLY
+aggregate row counts (and a small number of de-identified diagnostic flags) at each step into a
+single plain-text QC log file - no patient-level data is written anywhere.
+
+Please knit/run this top to bottom, then send back the generated log file (printed path at the
+end of the run).
+-->
+
+```{r setup, include=FALSE}
+packages <- c("dplyr", "arrow", "yaml", "rprojroot", "stringr", "lubridate", "data.table")
+
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+invisible(sapply(packages, install_if_missing))
+rm(packages, install_if_missing)
+
+select <- dplyr::select
+
+project_root <- file.path(find_root(rprojroot::has_dir("CLIF_Proning_ICD10_Validation")),
+                           "CLIF_Proning_ICD10_Validation")
+knitr::opts_knit$set(root.dir = project_root)
+
+config <- yaml::read_yaml(paste0(project_root, '/config/config.yaml'))
+site             <- tolower(config$site)
+tables_location  <- config$clif_data_path
+project_location <- config$project_location
+
+setwd(project_location)
+
+# Log Accumulator - Every Diagnostic Line Goes Here Instead of Console/cat(), So the Entire Run
+# Can Be Written to a Single File the Site Sends Back
+qc_log <- character(0)
+log_line <- function(...) {
+  qc_log <<- c(qc_log, paste0(...))
+}
+log_blank <- function() {
+  qc_log <<- c(qc_log, "")
+}
+# Tagged Status Line - status Must Be One of PASS / WARN / FAIL / INFO
+log_status <- function(status, ...) {
+  if (!status %in% c("PASS", "WARN", "FAIL", "INFO")) {
+    stop("log_status() called with invalid status: ", status)
+  }
+  qc_log <<- c(qc_log, paste0("[", status, "] ", paste0(...)))
+}
+```
+
+```{r Same Hardcoded Parameters as Notebook 01}
+cohort_year_cutoff <- 2023
+
+proning_codes <- c("5A09B5K", "5A09C5K", "5A09D5K")
+proning_pattern <- paste0("^(", paste(proning_codes, collapse = "|"), ")")
+proning_code_map <- c(
+  "5A09B5K" = "Assistance with Resp Ventilation, <8 Hrs, Intub Prone",
+  "5A09C5K" = "Assistance with Resp Ventilation, 8-24 Hrs, Intub Prone",
+  "5A09D5K" = "Assistance with Resp Ventilation, >24 Hrs, Intub Prone"
+)
+
+ventilation_codes <- c("5A1935Z", "5A1945Z", "5A1955Z")
+ventilation_pattern <- paste0("^(", paste(ventilation_codes, collapse = "|"), ")")
+ventilation_code_map <- c(
+  "5A1935Z" = "Respiratory Ventilation, Less Than 24 Consecutive Hours",
+  "5A1945Z" = "Respiratory Ventilation, 24-96 Consecutive Hours",
+  "5A1955Z" = "Respiratory Ventilation, Greater Than 96 Consecutive Hours"
+)
+
+path_patient_procedures <- paste0(tables_location, '/clif_patient_procedures.parquet')
+path_hospital_diagnosis <- paste0(tables_location, '/clif_hospital_diagnosis.parquet')
+path_cohort_hosp_ids     <- paste0(project_location, '/project_tables/cohort_hospitalization_ids.RData')
+
+### Output Path for QC Log ---------------------------------------------------------
+icd_qc_log_dir  <- paste0(project_location, "/project_output/icd_qc_log")
+if (!dir.exists(icd_qc_log_dir)) dir.create(icd_qc_log_dir, recursive = TRUE)
+path_out_qc_log <- paste0(icd_qc_log_dir, '/', site, '_icd_matching_qc_log.txt')
+
+log_line("ICD MATCHING QC LOG - site: ", site, " - generated: ", as.character(Sys.time()))
+log_line("No patient-level data is included below - aggregate counts and PASS/WARN/FAIL/INFO flags only.")
+log_blank()
+```
+
+```{r Load Cohort Hospitalization IDs and Check Its Own Integrity}
+load(path_cohort_hosp_ids)
+
+log_line("== Section A: Cohort Hospitalization IDs Table (treated as fixed input from notebook 00) ==")
+log_status("INFO", "n rows = ", nrow(cohort_hospitalization_ids),
+           " | n distinct hospitalization_id = ", n_distinct(cohort_hospitalization_ids$hospitalization_id))
+log_status("INFO", "class(hospitalization_id) in cohort table: ", class(cohort_hospitalization_ids$hospitalization_id))
+
+# QC: Replicates Notebook 01's Own Duplicate-hospitalization_id Warning (its 'Load Cohort
+# Hospitalization IDs' chunk) - a Duplicate Here Fans Out the proning_icd/ventilation_icd Joins
+dup_check <- cohort_hospitalization_ids |> count(hospitalization_id) |> filter(n > 1)
+if (nrow(dup_check) > 0) {
+  log_status("FAIL", nrow(dup_check), " duplicate hospitalization_id value(s) found in cohort_hospitalization_ids. ",
+             "Notebook 01 itself warns about this - duplicates can misattribute ICD billing codes across patients ",
+             "in the proning_icd/ventilation_icd joins.")
+} else {
+  log_status("PASS", "No duplicate hospitalization_id values in cohort_hospitalization_ids.")
+}
+
+# QC: Does the cohort table itself contain whitespace/case inconsistencies that would make an
+# otherwise-matching hospitalization_id fail an exact string join?
+cohort_raw_distinct   <- n_distinct(cohort_hospitalization_ids$hospitalization_id)
+cohort_norm_distinct  <- n_distinct(toupper(trimws(as.character(cohort_hospitalization_ids$hospitalization_id))))
+if (cohort_raw_distinct != cohort_norm_distinct) {
+  log_status("WARN", "cohort_hospitalization_ids contains whitespace/case variants of the same ID (",
+             cohort_raw_distinct, " raw distinct vs ", cohort_norm_distinct, " normalized distinct) - ",
+             "could independently cause missed exact-string joins regardless of the procedures table.")
+} else {
+  log_status("PASS", "No whitespace/case variants detected within cohort_hospitalization_ids ",
+             "(raw distinct = normalized distinct = ", cohort_raw_distinct, ").")
+}
+log_blank()
+
+cohort_hospitalization_ids <- cohort_hospitalization_ids |>
+  mutate(hospitalization_id = as.character(hospitalization_id))
+cohort_ids_exact <- cohort_hospitalization_ids$hospitalization_id
+```
+
+```{r Section B - Raw Code Matches in clif_patient_procedures, Format Filter Isolated From Pattern Filter}
+procs_raw <- open_dataset(path_patient_procedures) |> collect()
+
+log_line("== Section B: clif_patient_procedures Raw Match Breakdown ==")
+log_status("INFO", "total n rows = ", nrow(procs_raw))
+
+# QC: Missingness That Would Silently Break grepl()/toupper() or the hospitalization_id Join
+n_na_code <- sum(is.na(procs_raw$procedure_code) | trimws(procs_raw$procedure_code) == "")
+n_na_fmt  <- sum(is.na(procs_raw$procedure_code_format) | trimws(procs_raw$procedure_code_format) == "")
+n_na_hosp <- sum(is.na(procs_raw$hospitalization_id))
+if (n_na_code > 0 || n_na_fmt > 0 || n_na_hosp > 0) {
+  log_status("WARN", "Missing/blank values found - procedure_code: ", n_na_code,
+             " | procedure_code_format: ", n_na_fmt, " | hospitalization_id: ", n_na_hosp,
+             " (rows with these missing cannot match regardless of case-sensitivity).")
+} else {
+  log_status("PASS", "No missing/blank procedure_code, procedure_code_format, or hospitalization_id values.")
+}
+
+fmt_counts <- procs_raw |> count(fmt = toupper(procedure_code_format), sort = TRUE)
+log_status("INFO", "Distinct procedure_code_format values (uppercased):")
+for (i in seq_len(nrow(fmt_counts))) {
+  log_line("  ", fmt_counts$fmt[i], ": ", fmt_counts$n[i])
+}
+
+n_fmt_only     <- procs_raw |> filter(toupper(procedure_code_format) %in% c("ICD10PCS", "ICD-10-PCS")) |> nrow()
+n_pattern_only_prone <- procs_raw |> filter(grepl(proning_pattern, procedure_code, ignore.case = TRUE)) |> nrow()
+n_pattern_only_vent  <- procs_raw |> filter(grepl(ventilation_pattern, procedure_code, ignore.case = TRUE)) |> nrow()
+n_both_prone   <- procs_raw |> filter(toupper(procedure_code_format) %in% c("ICD10PCS", "ICD-10-PCS"),
+                                       grepl(proning_pattern, procedure_code, ignore.case = TRUE)) |> nrow()
+n_both_vent    <- procs_raw |> filter(toupper(procedure_code_format) %in% c("ICD10PCS", "ICD-10-PCS"),
+                                       grepl(ventilation_pattern, procedure_code, ignore.case = TRUE)) |> nrow()
+
+log_blank()
+if (n_fmt_only == 0) {
+  log_status("FAIL", "Zero rows match procedure_code_format %in% c('ICD10PCS','ICD-10-PCS') after toupper(). ",
+             "Check the distinct format values logged above against notebook 01's hardcoded list - this alone ",
+             "would zero out every downstream match regardless of procedure_code content.")
+} else {
+  log_status("PASS", "Rows passing format filter alone: ", n_fmt_only)
+}
+
+if (n_both_prone == 0) {
+  log_status("FAIL", "Zero rows pass BOTH format + proning pattern filter (raw match total). ",
+             "Notebook 01 would hit its own stop() here ('No ICD-10-PCS proning codes found').")
+} else {
+  log_status("PASS", "Rows passing BOTH (format + proning pattern): ", n_both_prone,
+             "  <- should match notebook 01's proning_counts_proc total")
+}
+
+if (n_both_vent == 0) {
+  log_status("FAIL", "Zero rows pass BOTH format + ventilation pattern filter (raw match total).")
+} else {
+  log_status("PASS", "Rows passing BOTH (format + ventilation pattern): ", n_both_vent,
+             "  <- should match notebook 01's vent raw count")
+}
+log_blank()
+
+# QC: Per-Exact-Code Breakdown - Notebook 01's Actual Flags (proning_lt8h/8_24h/gt24h,
+# vent_lt24h/24_96h/gt96h) Are Derived From Exact Code Equality, Not Just the Combined Pattern, So
+# This Reports Each Individual Code's Count Under the Same Format+Case-Insensitive-Match Filter
+log_line("Per-exact-code raw counts (format filter + exact code match, case-insensitive):")
+for (code in proning_codes) {
+  n_code <- procs_raw |>
+    filter(toupper(procedure_code_format) %in% c("ICD10PCS", "ICD-10-PCS"),
+           toupper(procedure_code) == code) |>
+    nrow()
+  status <- if (n_code == 0) "FAIL" else "PASS"
+  log_status(status, code, " (", proning_code_map[[code]], "): ", n_code,
+             ifelse(n_code == 0, " - code genuinely absent from raw table under this format filter", ""))
+}
+for (code in ventilation_codes) {
+  n_code <- procs_raw |>
+    filter(toupper(procedure_code_format) %in% c("ICD10PCS", "ICD-10-PCS"),
+           toupper(procedure_code) == code) |>
+    nrow()
+  status <- if (n_code == 0) "FAIL" else "PASS"
+  log_status(status, code, " (", ventilation_code_map[[code]], "): ", n_code,
+             ifelse(n_code == 0, " - code genuinely absent from raw table under this format filter", ""))
+}
+log_blank()
+```
+
+```{r Section C - Replicate Notebook 01s larger_proning_table Table-Selection Logic}
+# Notebook 01 compares raw proning-code match counts in clif_patient_procedures vs
+# clif_hospital_diagnosis, and stop()s the ENTIRE notebook if clif_hospital_diagnosis wins (its
+# downstream code only supports the clif_patient_procedures schema). If this site's data would
+# trigger that tie-break differently than other sites, notebook 01 would halt with an error before
+# ever reaching the ICD-flag derivation chunks - a full, non-silent explanation for "no ICD code
+# matched" if what the site is actually seeing is an uncaught error rather than empty output.
+
+log_line("== Section C: larger_proning_table Selection (notebook 01's table tie-break logic) ==")
+
+dx_raw <- open_dataset(path_hospital_diagnosis) |> collect()
+n_dx_prone <- dx_raw |> filter(grepl(proning_pattern, diagnosis_code, ignore.case = TRUE)) |> nrow()
+
+log_status("INFO", "clif_hospital_diagnosis proning-code raw match count: ", n_dx_prone)
+log_status("INFO", "clif_patient_procedures proning-code raw match count: ", n_both_prone)
+
+if (n_both_prone == 0 && n_dx_prone == 0) {
+  log_status("FAIL", "No proning ICD-10-PCS codes found in EITHER table - notebook 01's stop() at the ",
+             "'See which table is bigger' chunk would halt the entire notebook here.")
+  larger_proning_table <- NA_character_
+} else if (n_dx_prone > n_both_prone) {
+  log_status("FAIL", "clif_hospital_diagnosis has more proning-code matches (", n_dx_prone,
+             ") than clif_patient_procedures (", n_both_prone, "). Notebook 01's tie-break would select ",
+             "clif_hospital_diagnosis as larger_proning_table, which its downstream code does NOT support ",
+             "and will stop() with 'larger_proning_table resolved to...'. If the site is seeing an uncaught ",
+             "error rather than silent zero matches, THIS is almost certainly the cause.")
+  larger_proning_table <- "clif_hospital_diagnosis"
+} else {
+  log_status("PASS", "clif_patient_procedures has >= as many proning-code matches as clif_hospital_diagnosis (",
+             n_both_prone, " vs ", n_dx_prone, ") - notebook 01 would correctly select clif_patient_procedures.")
+  larger_proning_table <- "clif_patient_procedures"
+}
+log_blank()
+```
+
+```{r Section D - Replicate Notebook 01s Exact hospitalization_id Join Mechanics}
+# This replicates notebook 01's proning_icd/ventilation_icd chunks (lines ~478-528) exactly,
+# INCLUDING the order of operations: semi_join() is performed on the LAZY Arrow Dataset object
+# (before collect()), not on an in-memory data frame. This is checked separately against the
+# pure in-memory/R equivalent below, since an Arrow/dplyr backend quirk could in principle make
+# the lazy join behave differently without raising any error.
+
+log_line("== Section D: hospitalization_id Join to Cohort Table ==")
+
+matched_proning <- procs_raw |>
+  filter(toupper(procedure_code_format) %in% c("ICD10PCS", "ICD-10-PCS"),
+         grepl(proning_pattern, procedure_code, ignore.case = TRUE)) |>
+  mutate(procedure_code = toupper(procedure_code),
+         hospitalization_id_chr = as.character(hospitalization_id))
+
+matched_vent <- procs_raw |>
+  filter(toupper(procedure_code_format) %in% c("ICD10PCS", "ICD-10-PCS"),
+         grepl(ventilation_pattern, procedure_code, ignore.case = TRUE)) |>
+  mutate(procedure_code = toupper(procedure_code),
+         hospitalization_id_chr = as.character(hospitalization_id))
+
+log_status("INFO", "class(hospitalization_id) in clif_patient_procedures (before as.character): ",
+           class(procs_raw$hospitalization_id))
+
+for (lbl in c("proning", "ventilation")) {
+  df <- if (lbl == "proning") matched_proning else matched_vent
+  ids <- unique(df$hospitalization_id_chr)
+
+  n_exact_match <- sum(ids %in% cohort_ids_exact)
+  n_trim_match  <- sum(trimws(ids) %in% trimws(cohort_ids_exact))
+  n_norm_match  <- sum(toupper(trimws(ids)) %in% toupper(trimws(cohort_ids_exact)))
+
+  log_status("INFO", "[", lbl, "] distinct matched hospitalization_ids: ", length(ids))
+
+  if (n_exact_match == length(ids)) {
+    log_status("PASS", "[", lbl, "] exact string match to cohort table: ", n_exact_match, " / ", length(ids))
+  } else if (n_norm_match > n_exact_match) {
+    log_status("WARN", "[", lbl, "] exact match only ", n_exact_match, " / ", length(ids),
+               ", but trimws()+toupper() recovers ", n_norm_match, " / ", length(ids),
+               " - MISMATCH IS WHITESPACE/CASE FORMATTING IN hospitalization_id, NOT A REAL COHORT EXCLUSION. ",
+               "Fix: normalize (trimws+toupper) hospitalization_id before the semi_join in notebook 01.")
+  } else {
+    log_status("INFO", "[", lbl, "] exact match: ", n_exact_match, " / ", length(ids),
+               " (unchanged after trimws()+toupper() normalization)")
+  }
+
+  n_unmatched_after_norm <- length(ids) - n_norm_match
+  if (n_unmatched_after_norm > 0) {
+    log_status("WARN", "[", lbl, "] ", n_unmatched_after_norm, " / ", length(ids),
+               " matched hospitalization_ids are not found in cohort_hospitalization_ids under any ",
+               "normalization - out of this QC's scope to say why (cohort_hospitalization_ids is treated ",
+               "as a fixed input from notebook 00). See Section E to check if these are legitimately ",
+               "pre-cohort-cutoff.")
+  }
+  log_blank()
+}
+```
+
+```{r Section E - Reproduce Notebook 01s Lazy Arrow semi_join vs Pure In-Memory R Join}
+# Directly tests whether Arrow's dplyr backend (joining a lazy open_dataset() object against an
+# in-memory tibble, as notebook 01 does) returns a different row count than the logically
+# equivalent pure-R join on already-collected data. A mismatch here would point to an
+# Arrow/dplyr version-specific backend quirk at this site as the root cause, independent of any
+# ID formatting issue already checked in Section D.
+
+log_line("== Section E: Arrow-Lazy-Dataset Join vs In-Memory R Join (exact notebook 01 code path) ==")
+
+if (!is.na(larger_proning_table) && larger_proning_table == "clif_patient_procedures") {
+
+  arrow_join_count <- function(path, pattern) {
+    open_dataset(path) |>
+      mutate(hospitalization_id = as.character(hospitalization_id)) |>
+      dplyr::semi_join(cohort_hospitalization_ids, by = "hospitalization_id") |>
+      collect() |>
+      filter(toupper(procedure_code_format) %in% c("ICD10PCS", "ICD-10-PCS"),
+             grepl(pattern, procedure_code, ignore.case = TRUE)) |>
+      nrow()
+  }
+
+  r_join_count <- function(df, pattern) {
+    df |>
+      filter(grepl(pattern, procedure_code, ignore.case = TRUE),
+             hospitalization_id_chr %in% cohort_ids_exact) |>
+      nrow()
+  }
+
+  arrow_prone_n <- arrow_join_count(path_patient_procedures, proning_pattern)
+  r_prone_n     <- r_join_count(matched_proning, proning_pattern)
+  arrow_vent_n  <- arrow_join_count(path_patient_procedures, ventilation_pattern)
+  r_vent_n      <- r_join_count(matched_vent, ventilation_pattern)
+
+  if (arrow_prone_n == r_prone_n) {
+    log_status("PASS", "[proning] Arrow-lazy semi_join row count (", arrow_prone_n,
+               ") matches in-memory R join row count (", r_prone_n, ").")
+  } else {
+    log_status("FAIL", "[proning] Arrow-lazy semi_join row count (", arrow_prone_n,
+               ") DOES NOT MATCH in-memory R join row count (", r_prone_n, "). This points to an ",
+               "Arrow/dplyr backend quirk (likely tied to this site's installed 'arrow' package version) ",
+               "silently diverging from notebook 01's expected join behavior.")
+  }
+
+  if (arrow_vent_n == r_vent_n) {
+    log_status("PASS", "[ventilation] Arrow-lazy semi_join row count (", arrow_vent_n,
+               ") matches in-memory R join row count (", r_vent_n, ").")
+  } else {
+    log_status("FAIL", "[ventilation] Arrow-lazy semi_join row count (", arrow_vent_n,
+               ") DOES NOT MATCH in-memory R join row count (", r_vent_n, "). This points to an ",
+               "Arrow/dplyr backend quirk (likely tied to this site's installed 'arrow' package version) ",
+               "silently diverging from notebook 01's expected join behavior.")
+  }
+
+} else {
+  log_status("INFO", "Skipped - Section C resolved larger_proning_table away from clif_patient_procedures, ",
+             "so notebook 01 would stop() before reaching this join (see Section C).")
+}
+log_blank()
+```
+
+```{r Section F - Per-Exact-Code Counts After the Full Notebook 01 Equivalent Pipeline}
+# This is what actually feeds notebook 01's final flags (proning_lt8h/8_24h/gt24h,
+# vent_lt24h/24_96h/gt96h). Compare these numbers to Section B's raw per-code counts to see
+# exactly how many of each code survive the cohort restriction.
+
+log_line("== Section F: Per-Exact-Code Counts AFTER Cohort Join (feeds notebook 01's final flags) ==")
+
+for (code in proning_codes) {
+  n_raw  <- procs_raw |>
+    filter(toupper(procedure_code_format) %in% c("ICD10PCS", "ICD-10-PCS"), toupper(procedure_code) == code) |>
+    nrow()
+  n_code <- matched_proning |>
+    filter(procedure_code == code, hospitalization_id_chr %in% cohort_ids_exact) |>
+    nrow()
+  status <- if (n_raw > 0 && n_code == 0) "FAIL" else if (n_raw > 0 && n_code < n_raw) "WARN" else "PASS"
+  log_status(status, code, " (", proning_code_map[[code]], "): raw = ", n_raw, " -> after cohort join = ", n_code)
+}
+for (code in ventilation_codes) {
+  n_raw  <- procs_raw |>
+    filter(toupper(procedure_code_format) %in% c("ICD10PCS", "ICD-10-PCS"), toupper(procedure_code) == code) |>
+    nrow()
+  n_code <- matched_vent |>
+    filter(procedure_code == code, hospitalization_id_chr %in% cohort_ids_exact) |>
+    nrow()
+  status <- if (n_raw > 0 && n_code == 0) "FAIL" else if (n_raw > 0 && n_code < n_raw) "WARN" else "PASS"
+  log_status(status, code, " (", ventilation_code_map[[code]], "): raw = ", n_raw, " -> after cohort join = ", n_code)
+}
+log_blank()
+```
+
+```{r Section G - Rule Out Date-Based Exclusion}
+# Confirms matched ICD rows are not simply pre-dating the cohort_year_cutoff / earliest-billing
+# cutoff notebook 01 applies, which would be a legitimate (non-bug) reason for zero downstream
+# matches rather than a defect anywhere in the pipeline above.
+
+log_line("== Section G: Date-Based Exclusion Check ==")
+
+for (lbl in c("proning", "ventilation")) {
+  df <- if (lbl == "proning") matched_proning else matched_vent
+  n_na_dt <- sum(is.na(df$procedure_billed_dttm))
+  yrs <- year(df$procedure_billed_dttm)
+  yr_tab <- table(yrs, useNA = "ifany")
+
+  if (n_na_dt == nrow(df) && nrow(df) > 0) {
+    log_status("FAIL", "[", lbl, "] procedure_billed_dttm is NA for ALL ", nrow(df), " matched rows - ",
+               "notebook 01's earliest_procedure_billed_dttm (min(..., na.rm=TRUE)) would resolve to NA/Inf, ",
+               "which silently filters the entire cohort to zero rows downstream.")
+  } else if (n_na_dt > 0) {
+    log_status("WARN", "[", lbl, "] procedure_billed_dttm is NA for ", n_na_dt, " / ", nrow(df), " matched rows.")
+  } else {
+    log_status("PASS", "[", lbl, "] procedure_billed_dttm populated for all matched rows.")
+  }
+
+  log_status("INFO", "[", lbl, "] procedure_billed_dttm year distribution:")
+  for (yr_name in names(yr_tab)) {
+    log_line("  ", yr_name, ": ", yr_tab[[yr_name]])
+  }
+
+  n_pre_cutoff <- sum(yrs < cohort_year_cutoff, na.rm = TRUE)
+  if (n_pre_cutoff > 0) {
+    log_status("WARN", "[", lbl, "] ", n_pre_cutoff, " / ", nrow(df), " matched rows pre-date cohort_year_cutoff (",
+               cohort_year_cutoff, ") and would be legitimately excluded by notebook 01's ",
+               "'Filter Dataset Only to After The First Instance of Billing' step.")
+  } else {
+    log_status("PASS", "[", lbl, "] No matched rows pre-date cohort_year_cutoff (", cohort_year_cutoff, ").")
+  }
+  log_blank()
+}
+```
+
+```{r Write QC Log to File}
+n_fail <- sum(grepl("^\\[FAIL\\]", qc_log))
+n_warn <- sum(grepl("^\\[WARN\\]", qc_log))
+n_pass <- sum(grepl("^\\[PASS\\]", qc_log))
+
+log_line("== SUMMARY ==")
+log_line("PASS: ", n_pass, "  |  WARN: ", n_warn, "  |  FAIL: ", n_fail)
+log_blank()
+if (n_fail > 0) {
+  log_line("FAIL lines found above - these reproduce one of notebook 01's own stop()/zero-row failure")
+  log_line("modes and are the strongest candidates for the root cause. Review them first, in order.")
+} else if (n_warn > 0) {
+  log_line("No FAIL lines, but WARN lines were found - review these for formatting mismatches or")
+  log_line("legitimate (non-bug) cohort-eligibility exclusions.")
+} else {
+  log_line("All checks PASSED - this QC notebook could not reproduce the zero-match symptom using")
+  log_line("notebook 01's own logic. The discrepancy may be in a part of the pipeline not covered here")
+  log_line("(e.g. a difference between this run's environment/package versions and the one that")
+  log_line("produced the original zero-match result) - consider re-running notebook 01 itself fresh.")
+}
+log_blank()
+log_line("== How to Read This Log (section reference) ==")
+log_line("Section A: cohort_hospitalization_ids integrity (duplicates, whitespace/case within itself)")
+log_line("Section B: raw ICD code presence in clif_patient_procedures, per exact code")
+log_line("Section C: notebook 01's larger_proning_table tie-break - FAIL here means notebook 01 would")
+log_line("  error out entirely, which fully explains 'no ICD code matched' if that's what was observed")
+log_line("Section D: hospitalization_id join to cohort table, exact vs. normalized string match")
+log_line("Section E: Arrow-lazy-dataset join vs. pure in-memory R join - FAIL here points to an")
+log_line("  Arrow/dplyr package version quirk specific to this site")
+log_line("Section F: per-exact-code counts raw vs. after the cohort join - pinpoints exactly which")
+log_line("  code(s) vanish and at what stage")
+log_line("Section G: rules out cohort_year_cutoff / missing-date exclusion as the (non-bug) explanation")
+
+writeLines(qc_log, path_out_qc_log)
+message("QC log written to: ", path_out_qc_log, "\nPlease send this file back.")
+```
